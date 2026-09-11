@@ -8,7 +8,7 @@ use zjstatus::{
     config::{self, ModuleConfig, UpdateEventMask, ZellijState},
     frames, pipe,
     widgets::{
-        command::{CommandResult, CommandWidget},
+        command::{CommandWidget, store_command_result},
         datetime::DateTimeWidget,
         mode::ModeWidget,
         notification::NotificationWidget,
@@ -139,14 +139,13 @@ impl ZellijPlugin for State {
 
     #[tracing::instrument(skip_all, fields(event_type))]
     fn update(&mut self, event: Event) -> bool {
+        let mut should_render = false;
         if let Event::PermissionRequestResult(PermissionStatus::Granted) = event {
             self.got_permissions = true;
 
-            while !self.pending_events.is_empty() {
+            for event in std::mem::take(&mut self.pending_events) {
                 tracing::debug!("processing cached event");
-                let ev = self.pending_events.pop();
-
-                self.handle_event(ev.unwrap());
+                should_render |= self.handle_event(event);
             }
         }
 
@@ -157,7 +156,7 @@ impl ZellijPlugin for State {
             return false;
         }
 
-        self.handle_event(event)
+        should_render | self.handle_event(event)
     }
 
     #[tracing::instrument(skip_all)]
@@ -203,10 +202,9 @@ impl State {
                 tracing::debug!(mode = ?mode_info.mode);
                 tracing::debug!(mode = ?mode_info.session_name);
 
+                should_render = self.state.mode != mode_info;
                 self.state.mode = mode_info;
                 self.state.cache_mask = UpdateEventMask::Mode as u8;
-
-                should_render = true;
             }
             Event::PaneUpdate(pane_info) => {
                 tracing::Span::current().record("event_type", "Event::PaneUpdate");
@@ -226,10 +224,9 @@ impl State {
                     false,
                 );
 
+                should_render = self.state.panes != pane_info;
                 self.state.panes = pane_info;
                 self.state.cache_mask = UpdateEventMask::Tab as u8;
-
-                should_render = true;
             }
             Event::PermissionRequestResult(result) => {
                 tracing::Span::current().record("event_type", "Event::PermissionRequestResult");
@@ -245,29 +242,8 @@ impl State {
                     context = ?context
                 );
 
-                self.state.cache_mask = UpdateEventMask::Command as u8;
-
-                if let Some(name) = context.get("name") {
-                    let stdout = match String::from_utf8(stdout) {
-                        Ok(s) => s,
-                        Err(_) => "".to_owned(),
-                    };
-
-                    let stderr = match String::from_utf8(stderr) {
-                        Ok(s) => s,
-                        Err(_) => "".to_owned(),
-                    };
-
-                    self.state.command_results.insert(
-                        name.to_owned(),
-                        CommandResult {
-                            exit_code,
-                            stdout,
-                            stderr,
-                            context,
-                        },
-                    );
-                }
+                should_render =
+                    store_command_result(&mut self.state, exit_code, stdout, stderr, context);
             }
             Event::SessionUpdate(session_info, _) => {
                 tracing::Span::current().record("event_type", "Event::SessionUpdate");
@@ -291,18 +267,14 @@ impl State {
                 }
 
                 self.state.sessions = session_info;
-                self.state.cache_mask = UpdateEventMask::Session as u8;
-
-                should_render = true;
             }
             Event::TabUpdate(tab_info) => {
                 tracing::Span::current().record("event_type", "Event::TabUpdate");
                 tracing::debug!(tab_count = ?tab_info.len());
 
-                self.state.cache_mask = UpdateEventMask::Tab as u8;
+                should_render = self.state.tabs != tab_info;
                 self.state.tabs = tab_info;
-
-                should_render = true;
+                self.state.cache_mask = UpdateEventMask::Tab as u8;
             }
             Event::Timer(_) => {
                 tracing::Span::current().record("event_type", "Event::Timer");
