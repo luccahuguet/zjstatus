@@ -1,11 +1,6 @@
 use kdl::{KdlDocument, KdlError};
 use lazy_static::lazy_static;
-use std::{
-    collections::BTreeMap,
-    fs::{File, remove_file},
-    ops::Sub,
-    path::{Path, PathBuf},
-};
+use std::{cell::RefCell, collections::BTreeMap, ops::Sub, path::PathBuf};
 
 use chrono::{DateTime, Duration, Local};
 use regex::Regex;
@@ -79,6 +74,7 @@ pub fn store_command_result(
 pub struct CommandWidget {
     config: BTreeMap<String, CommandConfig>,
     zj_conf: BTreeMap<String, String>,
+    last_runs: RefCell<BTreeMap<String, i64>>,
 }
 
 impl CommandWidget {
@@ -86,6 +82,7 @@ impl CommandWidget {
         Self {
             config: parse_config(config),
             zj_conf: config.clone(),
+            last_runs: RefCell::new(BTreeMap::new()),
         }
     }
 }
@@ -99,7 +96,7 @@ impl Widget for CommandWidget {
             }
         };
 
-        run_command_if_needed(command_config.clone(), name, state);
+        run_command_if_needed(command_config.clone(), name, state, &self.last_runs);
 
         let command_result = match state.command_results.get(name) {
             Some(cr) => cr,
@@ -200,16 +197,30 @@ fn render_dynamic_formatted_content(content: &str, config: &BTreeMap<String, Str
 }
 
 #[tracing::instrument(skip(command_config, state))]
-fn run_command_if_needed(command_config: CommandConfig, name: &str, state: &ZellijState) -> bool {
+fn run_command_if_needed(
+    command_config: CommandConfig,
+    name: &str,
+    state: &ZellijState,
+    last_runs: &RefCell<BTreeMap<String, i64>>,
+) -> bool {
     let got_result = state.command_results.contains_key(name);
     if got_result && command_config.interval == 0 {
         return false;
     }
 
     let ts = Local::now();
-    let last_run = get_timestamp_from_event_or_default(name, state, command_config.interval);
+    if last_runs.borrow().get(name).is_some_and(|last_run| {
+        command_config.interval == 0 || ts.timestamp() - last_run < command_config.interval
+    }) {
+        return false;
+    }
+    let last_run = get_timestamp_from_event_or_default(name, state);
 
     if ts.timestamp() - last_run.timestamp() >= command_config.interval {
+        last_runs
+            .borrow_mut()
+            .insert(name.to_owned(), ts.timestamp());
+
         let mut context = BTreeMap::new();
         context.insert("name".to_owned(), name.to_owned());
         context.insert(
@@ -361,17 +372,9 @@ fn get_env_vars(doc: KdlDocument) -> BTreeMap<String, String> {
     output
 }
 
-fn get_timestamp_from_event_or_default(
-    name: &str,
-    state: &ZellijState,
-    interval: i64,
-) -> DateTime<Local> {
+fn get_timestamp_from_event_or_default(name: &str, state: &ZellijState) -> DateTime<Local> {
     let command_result = state.command_results.get(name);
     if command_result.is_none() {
-        if lock(name, state.clone()) {
-            return Local::now();
-        }
-
         return Sub::<Duration>::sub(Local::now(), Duration::try_days(1).unwrap());
     }
     let command_result = command_result.unwrap();
@@ -382,33 +385,9 @@ fn get_timestamp_from_event_or_default(
     }
     let ts_context = ts_context.unwrap();
 
-    if Local::now().timestamp() - state.start_time.timestamp() < interval {
-        release(name, state.clone());
-    }
-
     match DateTime::parse_from_str(ts_context, TIMESTAMP_FORMAT) {
         Ok(ts) => ts.into(),
         Err(_) => Sub::<Duration>::sub(Local::now(), Duration::try_days(1).unwrap()),
-    }
-}
-
-fn lock(name: &str, state: ZellijState) -> bool {
-    let path = format!("/tmp/{}.{}.lock", state.plugin_uuid, name);
-
-    if !Path::new(&path).exists() {
-        let _ = File::create(path);
-
-        return false;
-    }
-
-    true
-}
-
-fn release(name: &str, state: ZellijState) {
-    let path = format!("/tmp/{}.{}.lock", state.plugin_uuid, name);
-
-    if Path::new(&path).exists() {
-        let _ = remove_file(path);
     }
 }
 
@@ -468,7 +447,6 @@ fn commandline_parser(input: &str) -> Vec<String> {
 mod test {
     use super::*;
     use rstest::rstest;
-    use uuid::Uuid;
 
     #[test]
     fn stored_command_results_request_a_redraw() {
@@ -501,14 +479,10 @@ mod test {
             ("command_cpu_interval".into(), "0".into()),
             ("command_cpu_rendermode".into(), "raw".into()),
         ]);
-        let mut state = ZellijState {
-            plugin_uuid: Uuid::new_v4().to_string(),
-            ..Default::default()
-        };
+        let mut state = ZellijState::default();
 
         let widget = CommandWidget::new(&config);
         assert_eq!(widget.process("command_cpu", &state), "");
-        release("command_cpu", state.clone());
 
         config.insert("command_cpu_placeholder".into(), "cpu …".into());
         let widget = CommandWidget::new(&config);
@@ -521,7 +495,6 @@ mod test {
             BTreeMap::from([("name".into(), "command_cpu".into())]),
         );
         assert_eq!(widget.process("command_cpu", &state), "cpu 10%");
-        release("command_cpu", state);
     }
 
     #[test]
@@ -582,25 +555,22 @@ mod test {
         #[case] state: &ZellijState,
         #[case] expected: bool,
     ) {
-        let mut state = state.clone();
-        state.plugin_uuid = Uuid::new_v4().to_string();
-
-        let res = run_command_if_needed(
-            CommandConfig {
-                command: "echo test".to_owned(),
-                format: Vec::new(),
-                placeholder: "".to_owned(),
-                env: None,
-                cwd: None,
-                interval,
-                render_mode: RenderMode::Static,
-                click_action: "".to_owned(),
-                hide_on_empty_stdout: false,
-            },
-            "test",
-            &state,
-        );
-        release("test", state);
+        let config = CommandConfig {
+            command: "echo test".to_owned(),
+            format: Vec::new(),
+            placeholder: "".to_owned(),
+            env: None,
+            cwd: None,
+            interval,
+            render_mode: RenderMode::Static,
+            click_action: "".to_owned(),
+            hide_on_empty_stdout: false,
+        };
+        let last_runs = RefCell::new(BTreeMap::new());
+        let res = run_command_if_needed(config.clone(), "test", state, &last_runs);
+        if res {
+            assert!(!run_command_if_needed(config, "test", state, &last_runs));
+        }
         assert_eq!(res, expected);
     }
 }

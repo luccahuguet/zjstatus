@@ -1,8 +1,6 @@
 use zellij_tile::prelude::*;
 
-use chrono::Local;
 use std::{collections::BTreeMap, sync::Arc};
-use uuid::Uuid;
 
 use zjstatus::{
     config::{self, ModuleConfig, UpdateEventMask, ZellijState},
@@ -22,6 +20,57 @@ use zjstatus::{
 
 // Matches the old incidental Zellij session scan cadence.
 const REFRESH_INTERVAL_SECONDS: f64 = 1.0;
+const VIEW_REQUEST_PIPE: &str = "zjstatus.view_request.v1";
+const VIEW_FRAME_PIPE: &str = "zjstatus.view_frame.v1";
+const CONTROLLER_READY_PIPE: &str = "zjstatus.controller_ready.v1";
+const MAX_BAR_WIDTH: usize = 10_000;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Role {
+    #[default]
+    Standalone,
+    Controller,
+    View,
+}
+
+impl Role {
+    fn from_config(configuration: &BTreeMap<String, String>) -> Self {
+        match configuration.get("role").map(String::as_str) {
+            Some("controller") => Self::Controller,
+            Some("view") => Self::View,
+            _ => Self::Standalone,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ViewRequest {
+    Width(usize),
+    LeftClick(isize, usize),
+    RightClick(isize, usize),
+}
+
+fn parse_view_request(raw: &str) -> Option<ViewRequest> {
+    let mut fields = raw.split(':');
+    let kind = fields.next()?;
+    let request = match kind {
+        "width" => {
+            let width = fields.next()?.parse().ok()?;
+            (width > 0 && width <= MAX_BAR_WIDTH).then_some(ViewRequest::Width(width))?
+        }
+        "left" | "right" => {
+            let line = fields.next()?.parse().ok()?;
+            let col = fields.next()?.parse().ok()?;
+            if kind == "left" {
+                ViewRequest::LeftClick(line, col)
+            } else {
+                ViewRequest::RightClick(line, col)
+            }
+        }
+        _ => return None,
+    };
+    fields.next().is_none().then_some(request)
+}
 
 #[derive(Default)]
 struct State {
@@ -32,6 +81,10 @@ struct State {
     module_config: config::ModuleConfig,
     widget_map: BTreeMap<String, Arc<dyn Widget>>,
     err: Option<anyhow::Error>,
+    role: Role,
+    view_width: Option<usize>,
+    view_frame: String,
+    views: BTreeMap<u32, usize>,
 }
 
 #[cfg(not(test))]
@@ -59,15 +112,30 @@ impl ZellijPlugin for State {
         #[cfg(feature = "tracing")]
         init_tracing();
 
-        // we need the ReadApplicationState permission to receive the ModeUpdate and TabUpdate
-        // events
-        // we need the RunCommands permission to run "cargo test" in a floating window
-        request_permission(&[
+        self.role = Role::from_config(&configuration);
+        if self.role == Role::View {
+            request_permission(&[
+                PermissionType::ReadApplicationState,
+                PermissionType::ChangeApplicationState,
+                PermissionType::RunCommands,
+                PermissionType::MessageAndLaunchOtherPlugins,
+            ]);
+            subscribe(&[EventType::Mouse, EventType::PermissionRequestResult]);
+            self.got_permissions = false;
+            self.view_width = None;
+            self.view_frame.clear();
+            return;
+        }
+
+        let mut permissions = vec![
             PermissionType::ReadApplicationState,
             PermissionType::ChangeApplicationState,
             PermissionType::RunCommands,
-        ]);
-
+        ];
+        if self.role == Role::Controller {
+            permissions.push(PermissionType::MessageAndLaunchOtherPlugins);
+        }
+        request_permission(&permissions);
         subscribe(&[
             EventType::Mouse,
             EventType::ModeUpdate,
@@ -95,8 +163,7 @@ impl ZellijPlugin for State {
         self.userspace_configuration = configuration;
         self.pending_events = Vec::new();
         self.got_permissions = false;
-        let uid = Uuid::new_v4();
-
+        self.views.clear();
         self.state = ZellijState {
             cols: 0,
             tab_width_limit: None,
@@ -104,16 +171,29 @@ impl ZellijPlugin for State {
             pipe_results: BTreeMap::new(),
             mode: ModeInfo::default(),
             panes: PaneManifest::default(),
-            plugin_uuid: uid.to_string(),
             tabs: Vec::new(),
             sessions: Vec::new(),
-            start_time: Local::now(),
             cache_mask: 0,
             incoming_notification: None,
         };
     }
 
     fn pipe(&mut self, pipe_message: PipeMessage) -> bool {
+        if self.role == Role::View {
+            if pipe_message.name == VIEW_FRAME_PIPE {
+                if let Some(frame) = pipe_message.payload {
+                    self.view_frame = frame;
+                    return true;
+                }
+            } else if pipe_message.name == CONTROLLER_READY_PIPE && self.got_permissions {
+                self.request_frame();
+            }
+            return false;
+        }
+        if self.role == Role::Controller && pipe_message.name == VIEW_REQUEST_PIPE {
+            return self.handle_view_request(&pipe_message);
+        }
+
         let mut should_render = false;
 
         match pipe_message.source {
@@ -134,11 +214,20 @@ impl ZellijPlugin for State {
             }
         }
 
-        should_render
+        if self.role == Role::Controller && should_render {
+            self.publish_views();
+            false
+        } else {
+            should_render
+        }
     }
 
     #[tracing::instrument(skip_all, fields(event_type))]
     fn update(&mut self, event: Event) -> bool {
+        if self.role == Role::View {
+            return self.update_view(event);
+        }
+
         let mut should_render = false;
         if let Event::PermissionRequestResult(PermissionStatus::Granted) = event {
             self.got_permissions = true;
@@ -156,11 +245,40 @@ impl ZellijPlugin for State {
             return false;
         }
 
-        should_render | self.handle_event(event)
+        should_render |= self.handle_event(event);
+        if self.role == Role::Controller {
+            if self.got_permissions && should_render {
+                self.publish_views();
+            }
+            false
+        } else {
+            should_render
+        }
     }
 
     #[tracing::instrument(skip_all)]
     fn render(&mut self, _rows: usize, cols: usize) {
+        if self.role == Role::Controller {
+            return;
+        }
+        if self.role == Role::View {
+            if self.view_width != Some(cols) {
+                self.view_width = Some(cols);
+                self.view_frame.clear();
+                if self.got_permissions {
+                    self.request_frame();
+                }
+            }
+            print!(
+                "{}",
+                if self.view_frame.is_empty() {
+                    " … "
+                } else {
+                    &self.view_frame
+                }
+            );
+            return;
+        }
         if !self.got_permissions {
             return;
         }
@@ -184,6 +302,110 @@ impl ZellijPlugin for State {
 }
 
 impl State {
+    fn request_frame(&self) {
+        if let Some(width) = self.view_width {
+            pipe_message_to_plugin(
+                MessageToPlugin::new(VIEW_REQUEST_PIPE).with_payload(format!("width:{width}")),
+            );
+        }
+    }
+
+    fn update_view(&mut self, event: Event) -> bool {
+        match event {
+            Event::PermissionRequestResult(status) => {
+                self.got_permissions = status == PermissionStatus::Granted;
+                if self.got_permissions {
+                    self.request_frame();
+                }
+                true
+            }
+            Event::Mouse(Mouse::LeftClick(line, col)) if self.got_permissions => {
+                pipe_message_to_plugin(
+                    MessageToPlugin::new(VIEW_REQUEST_PIPE)
+                        .with_payload(format!("left:{line}:{col}")),
+                );
+                false
+            }
+            Event::Mouse(Mouse::RightClick(line, col)) if self.got_permissions => {
+                pipe_message_to_plugin(
+                    MessageToPlugin::new(VIEW_REQUEST_PIPE)
+                        .with_payload(format!("right:{line}:{col}")),
+                );
+                false
+            }
+            _ => false,
+        }
+    }
+
+    fn render_frame(&mut self, cols: usize) -> String {
+        if let Some(err) = &self.err {
+            return format!("Error: {err:?}");
+        }
+        self.state.cols = cols;
+        self.module_config
+            .render_bar(self.state.clone(), self.widget_map.clone())
+    }
+
+    fn publish_view(&mut self, plugin_id: u32, cols: usize) {
+        let frame = self.render_frame(cols);
+        pipe_message_to_plugin(
+            MessageToPlugin::new(VIEW_FRAME_PIPE)
+                .with_destination_plugin_id(plugin_id)
+                .with_payload(frame),
+        );
+    }
+
+    fn publish_views(&mut self) {
+        let views: Vec<_> = self.views.iter().map(|(&id, &cols)| (id, cols)).collect();
+        let mut frames = BTreeMap::new();
+        for (plugin_id, cols) in views {
+            let frame = frames
+                .entry(cols)
+                .or_insert_with(|| self.render_frame(cols))
+                .clone();
+            pipe_message_to_plugin(
+                MessageToPlugin::new(VIEW_FRAME_PIPE)
+                    .with_destination_plugin_id(plugin_id)
+                    .with_payload(frame),
+            );
+        }
+    }
+
+    fn handle_view_request(&mut self, message: &PipeMessage) -> bool {
+        let PipeSource::Plugin(plugin_id) = &message.source else {
+            return false;
+        };
+        let plugin_id = *plugin_id;
+        let Some(request) = message.payload.as_deref().and_then(parse_view_request) else {
+            return false;
+        };
+        match request {
+            ViewRequest::Width(cols) => {
+                self.views.insert(plugin_id, cols);
+                if self.got_permissions {
+                    self.publish_view(plugin_id, cols);
+                }
+            }
+            ViewRequest::LeftClick(line, col) | ViewRequest::RightClick(line, col) => {
+                let Some(&cols) = self.views.get(&plugin_id) else {
+                    return false;
+                };
+                self.state.cols = cols;
+                let mouse = if matches!(request, ViewRequest::LeftClick(_, _)) {
+                    Mouse::LeftClick(line, col)
+                } else {
+                    Mouse::RightClick(line, col)
+                };
+                self.module_config.handle_mouse_action(
+                    self.state.clone(),
+                    mouse,
+                    self.widget_map.clone(),
+                );
+            }
+        }
+        false
+    }
+
     fn handle_event(&mut self, event: Event) -> bool {
         let mut should_render = false;
         match event {
@@ -210,6 +432,17 @@ impl State {
                 tracing::Span::current().record("event_type", "Event::PaneUpdate");
                 tracing::debug!(pane_count = ?pane_info.panes.len());
 
+                if self.role == Role::Controller {
+                    let live: std::collections::HashSet<_> = pane_info
+                        .panes
+                        .values()
+                        .flatten()
+                        .filter(|pane| pane.is_plugin)
+                        .map(|pane| pane.id)
+                        .collect();
+                    self.views.retain(|plugin_id, _| live.contains(plugin_id));
+                }
+
                 frames::hide_frames_conditionally(
                     &frames::FrameConfig::new(
                         self.module_config.hide_frame_for_single_pane,
@@ -232,6 +465,9 @@ impl State {
                 tracing::Span::current().record("event_type", "Event::PermissionRequestResult");
                 tracing::debug!(result = ?result);
                 set_selectable(false);
+                if result == PermissionStatus::Granted && self.role == Role::Controller {
+                    pipe_message_to_plugin(MessageToPlugin::new(CONTROLLER_READY_PIPE));
+                }
             }
             Event::RunCommandResult(exit_code, stdout, stderr, context) => {
                 tracing::Span::current().record("event_type", "Event::RunCommandResult");
@@ -341,4 +577,48 @@ fn register_widgets(configuration: &BTreeMap<String, String>) -> BTreeMap<String
     tracing::debug!("registered widgets: {:?}", widget_map.keys());
 
     widget_map
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn controller_view_protocol_is_bounded_and_exact() {
+        assert_eq!(
+            parse_view_request("width:220"),
+            Some(ViewRequest::Width(220))
+        );
+        assert_eq!(
+            parse_view_request("left:0:42"),
+            Some(ViewRequest::LeftClick(0, 42))
+        );
+        assert_eq!(
+            parse_view_request("right:0:7"),
+            Some(ViewRequest::RightClick(0, 7))
+        );
+        for invalid in [
+            "",
+            "width:0",
+            "width:10001",
+            "width:80:extra",
+            "left:1",
+            "hover:0:1",
+        ] {
+            assert_eq!(parse_view_request(invalid), None, "{invalid:?}");
+        }
+    }
+
+    #[test]
+    fn role_defaults_to_standalone() {
+        assert_eq!(Role::from_config(&BTreeMap::new()), Role::Standalone);
+        assert_eq!(
+            Role::from_config(&BTreeMap::from([("role".into(), "view".into())])),
+            Role::View
+        );
+        assert_eq!(
+            Role::from_config(&BTreeMap::from([("role".into(), "controller".into())])),
+            Role::Controller
+        );
+    }
 }

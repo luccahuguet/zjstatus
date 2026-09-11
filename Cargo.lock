@@ -3341,7 +3341,6 @@ dependencies = [
  "rstest",
  "tracing",
  "tracing-subscriber",
- "uuid",
  "zellij-tile",
 ]
 
